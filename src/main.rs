@@ -5,6 +5,10 @@ use std::io::Read;
 use std::path::PathBuf;
 use zip::ZipArchive;
 
+use crate::mod_manager::ModManager;
+
+mod errors;
+mod mod_manager;
 mod mrpack;
 
 #[derive(Parser, Debug)]
@@ -41,6 +45,12 @@ fn main() -> Result<(), IndexError> {
 
     let modrinth_index_data = get_index_data(&mut zip_file)?;
 
-    println!("MRPack {}!", modrinth_index_data);
+    let manager = ModManager::new(modrinth_index_data.files);
+
+    match manager.sync() {
+        Ok(_) => println!("Sync completed successfully"),
+        Err(err) => println!("Sync failed: {}", err),
+    }
+
     Ok(())
 }

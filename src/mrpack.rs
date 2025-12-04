@@ -1,6 +1,7 @@
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, fmt::Display, path::PathBuf};
+use url::Url;
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -60,7 +61,7 @@ pub struct MRFile {
     pub path: PathBuf,
     pub hashes: FileHashes,
     pub env: Option<Environment>,
-    pub downloads: Vec<String>,
+    pub downloads: Vec<Url>,
     pub file_size: u32,
 }
 

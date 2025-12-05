@@ -6,20 +6,25 @@ use sha1::{Digest, Sha1};
 use sha2::Sha512;
 use std::{
     collections::HashMap,
-    fs::{File, create_dir_all},
+    fs::{File, create_dir_all, remove_dir_all, remove_file},
     io::{Read, Write},
     path::{Path, PathBuf},
 };
 use url::Url;
+use walkdir::WalkDir;
 
 pub struct ModManager {
     files: Vec<MRFile>,
     overrides: HashMap<PathBuf, Vec<u8>>,
     client: Client,
+    prune: bool,
 }
 
+const PRUNE_DIRECTORIES_INDEX: &[&str] = &["mods", "resourcepacks"];
+const PRUNE_DIRECTORIES_OVERRIDES: &[&str] = &["config"];
+
 impl ModManager {
-    pub fn new(index: MRIndex, overrides: HashMap<PathBuf, Vec<u8>>) -> Self {
+    pub fn new(index: MRIndex, overrides: HashMap<PathBuf, Vec<u8>>, prune: bool) -> Self {
         ModManager {
             files: index
                 .files
@@ -33,6 +38,7 @@ impl ModManager {
                 .collect(),
             overrides,
             client: Client::new(),
+            prune,
         }
     }
 
@@ -60,11 +66,16 @@ impl ModManager {
             pb_files.inc(1);
         }
         pb_files.finish_and_clear();
+        println!(
+            "Server files: [✔] {}/{}",
+            self.files.len(),
+            self.files.len()
+        );
 
         let pb_overrides = ProgressBar::new(self.overrides.len() as u64);
         pb_overrides.set_style(
             ProgressStyle::default_bar()
-                .template("Overrides:   [{bar:40.green/blue}] {pos}/{len} ({eta})")
+                .template("Overrides: [{bar:40.green/blue}] {pos}/{len} ({eta})")
                 .unwrap()
                 .progress_chars("=> "),
         );
@@ -80,8 +91,71 @@ impl ModManager {
             pb_overrides.inc(1);
         }
         pb_overrides.finish_and_clear();
+        println!(
+            "Overrides: [✔] {}/{}",
+            self.overrides.len(),
+            self.overrides.len()
+        );
+
+        if self.prune {
+            let pb_prune = ProgressBar::new_spinner().with_style(
+                ProgressStyle::default_spinner()
+                    .template("Pruning files: [{spinner}]")
+                    .unwrap(),
+            );
+
+            let mut pruned_files = 0;
+
+            for dir in PRUNE_DIRECTORIES_INDEX {
+                let files = WalkDir::new(dir)
+                    .into_iter()
+                    .filter_map(|e| e.ok())
+                    .filter(|entry| entry.file_type().is_file());
+
+                for file in files {
+                    let is_in_index = self.files.iter().any(|f| f.path == file.path());
+                    if !is_in_index {
+                        self.delete_file(&file.path())?;
+                        pruned_files += 1;
+                    }
+                }
+            }
+
+            for dir in PRUNE_DIRECTORIES_OVERRIDES {
+                let files = WalkDir::new(dir)
+                    .into_iter()
+                    .filter_map(|e| e.ok())
+                    .filter(|entry| entry.file_type().is_file());
+
+                for file in files {
+                    let is_in_overrides =
+                        self.overrides.iter().any(|(path, _)| path == file.path());
+                    if !is_in_overrides {
+                        self.delete_file(&file.path())?;
+                        pruned_files += 1;
+                    }
+                }
+            }
+
+            pb_prune.finish_and_clear();
+            println!("Pruning files: [✔] {}/{}", pruned_files, pruned_files);
+        }
 
         Ok(())
+    }
+
+    fn delete_file(&self, path: &Path) -> Result<(), FileError> {
+        if path.is_dir() {
+            match remove_dir_all(path) {
+                Ok(_) => Ok(()),
+                Err(_) => Err(FileError::DeleteFailed),
+            }
+        } else {
+            match remove_file(path) {
+                Ok(_) => Ok(()),
+                Err(_) => Err(FileError::DeleteFailed),
+            }
+        }
     }
 
     fn download_file(&self, file: &MRFile, m: &MultiProgress) -> Result<(), FileError> {

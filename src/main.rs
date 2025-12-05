@@ -17,6 +17,8 @@ mod mrpack;
 struct Args {
     #[arg(short, long, value_name = "FILE")]
     path: PathBuf,
+    #[arg(long)]
+    prune: bool,
 }
 
 type IndexError = Box<dyn std::error::Error>;
@@ -79,9 +81,7 @@ fn main() -> Result<(), IndexError> {
     let modrinth_index = get_index_data(&mut zip_file)?;
     let overrides = read_overrides(&mut zip_file)?;
 
-    println!("Total files: {}", modrinth_index.files.len());
-
-    let manager = ModManager::new(modrinth_index, overrides);
+    let manager = ModManager::new(modrinth_index, overrides, args.prune);
 
     match manager.sync() {
         Ok(_) => println!("Sync completed successfully"),

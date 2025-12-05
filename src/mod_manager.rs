@@ -1,12 +1,13 @@
 use crate::errors::FileError;
 use crate::mrpack::{MRFile, MRIndex, Requirement};
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use reqwest::blocking::Client;
 use sha1::{Digest, Sha1};
 use sha2::Sha512;
 use std::{
     collections::HashMap,
     fs::{File, create_dir_all},
-    io::Read,
+    io::{Read, Write},
     path::{Path, PathBuf},
 };
 use url::Url;
@@ -36,83 +37,109 @@ impl ModManager {
     }
 
     pub fn sync(&self) -> Result<(), FileError> {
-        println!("Syncing {} server files..", self.files.len());
+        let m = MultiProgress::new();
+
+        let pb_files = m.add(ProgressBar::new(self.files.len() as u64));
+        pb_files.set_style(
+            ProgressStyle::default_bar()
+                .template("Server files: [{bar:40.cyan/blue}] {pos}/{len} ({eta})")
+                .unwrap()
+                .progress_chars("=> "),
+        );
+
         for file in &self.files {
-            let current_file_result = File::open(&file.path);
+            let need_download = match File::open(&file.path) {
+                Ok(mut f) => !self.file_is_valid(&mut f, file),
+                Err(_) => true,
+            };
 
-            match current_file_result {
-                Ok(mut current_file) => {
-                    if !self.file_is_valid(&mut current_file, file) {
-                        self.delete_file(&file.path)?;
-                        self.download_file(&file)?;
-                    }
-                }
-                Err(_) => {
-                    self.download_file(&file)?;
-                }
+            if need_download {
+                self.download_file(file, &m)?;
             }
-        }
 
-        println!("Syncing overrides..");
+            pb_files.inc(1);
+        }
+        pb_files.finish_and_clear();
+
+        let pb_overrides = ProgressBar::new(self.overrides.len() as u64);
+        pb_overrides.set_style(
+            ProgressStyle::default_bar()
+                .template("Overrides:   [{bar:40.green/blue}] {pos}/{len} ({eta})")
+                .unwrap()
+                .progress_chars("=> "),
+        );
+
         for (path, content) in &self.overrides {
-            let dir_path = path.parent().unwrap();
-            if !dir_path.exists() {
-                create_dir_all(dir_path)?;
+            if let Some(parent) = path.parent() {
+                if !parent.exists() {
+                    create_dir_all(parent)?;
+                }
             }
             let mut file = File::create(path)?;
-            std::io::copy(&mut content.as_slice(), &mut file)?;
+            file.write_all(content)?;
+            pb_overrides.inc(1);
         }
-        println!("Sync complete!");
+        pb_overrides.finish_and_clear();
 
         Ok(())
     }
 
-    fn try_download_file(&self, url: &Url, path: &PathBuf) -> Result<(), FileError> {
+    fn download_file(&self, file: &MRFile, m: &MultiProgress) -> Result<(), FileError> {
+        if let Some(parent) = Path::new(&file.path).parent() {
+            if !parent.exists() {
+                create_dir_all(parent)?;
+            }
+        }
+
+        for url in &file.downloads {
+            match self.try_download_file(url, &file.path, m) {
+                Ok(()) => return Ok(()),
+                Err(_) => continue,
+            }
+        }
+
+        Err(FileError::AllDownloadsFailed)
+    }
+
+    fn try_download_file(
+        &self,
+        url: &Url,
+        path: &PathBuf,
+        m: &MultiProgress,
+    ) -> Result<(), FileError> {
         let mut response = self.client.get(url.clone()).send()?;
-        let mut file = File::create(path)?;
-        std::io::copy(&mut response, &mut file)?;
-        Ok(())
-    }
+        let total_size = response.content_length().unwrap_or(0);
 
-    fn download_file(&self, file: &MRFile) -> Result<(), FileError> {
-        let dir_path = Path::new(&file.path);
+        let pb_file = m.add(ProgressBar::new(total_size));
+        pb_file.set_style(
+            ProgressStyle::default_bar()
+                .template("Downloading: [{bar:40.green/blue}] {bytes}/{total_bytes} ({eta})")
+                .unwrap()
+                .progress_chars("=> "),
+        );
 
-        if !dir_path.parent().unwrap().exists() {
-            create_dir_all(dir_path.parent().unwrap())?;
-        }
-
-        let mut urls_iter = file.downloads.iter();
+        let mut file_handle = File::create(path)?;
+        let mut buffer = [0u8; 8192];
 
         loop {
-            match urls_iter.next() {
-                Some(url) => match self.try_download_file(url, &file.path) {
-                    Ok(()) => break Ok(()),
-                    Err(_) => {
-                        println!("Failed to download file {:?} from URL: {}", file.path, url);
-                        continue;
-                    }
-                },
-                None => {
-                    println!("All download URLs failed for file {:?}", file.path);
-                    break Err(FileError::AllDownloadsFailed);
-                }
-            };
+            let n = response.read(&mut buffer)?;
+            if n == 0 {
+                break;
+            }
+            file_handle.write_all(&buffer[..n])?;
+            pb_file.inc(n as u64);
         }
-    }
 
-    fn delete_file(&self, path: &PathBuf) -> Result<(), FileError> {
-        std::fs::remove_file(path).map_err(|_| FileError::DeleteFailed)?;
+        pb_file.finish_and_clear();
         Ok(())
     }
 
     fn file_is_valid(&self, file: &mut File, mr_file: &MRFile) -> bool {
-        let mut file_data: Vec<u8> =
-            Vec::with_capacity(file.metadata().map(|md| md.len() as usize).unwrap_or(0));
+        let mut data = Vec::with_capacity(file.metadata().map(|md| md.len() as usize).unwrap_or(0));
+        file.read_to_end(&mut data).unwrap();
 
-        file.read_to_end(&mut file_data).unwrap();
-
-        self.check_sha1(&file_data, &mr_file.hashes.sha1)
-            && self.check_sha512(&file_data, &mr_file.hashes.sha512)
+        self.check_sha1(&data, &mr_file.hashes.sha1)
+            && self.check_sha512(&data, &mr_file.hashes.sha512)
     }
 
     fn check_sha1(&self, data: &[u8], expected_hash: &[u8; 20]) -> bool {

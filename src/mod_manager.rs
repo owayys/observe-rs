@@ -1,9 +1,10 @@
 use crate::errors::FileError;
-use crate::mrpack::MRFile;
+use crate::mrpack::{MRFile, MRIndex, Requirement};
 use reqwest::blocking::Client;
 use sha1::{Digest, Sha1};
 use sha2::Sha512;
 use std::{
+    collections::HashMap,
     fs::{File, create_dir_all},
     io::Read,
     path::{Path, PathBuf},
@@ -12,18 +13,30 @@ use url::Url;
 
 pub struct ModManager {
     files: Vec<MRFile>,
+    overrides: HashMap<PathBuf, Vec<u8>>,
     client: Client,
 }
 
 impl ModManager {
-    pub fn new(files: Vec<MRFile>) -> Self {
+    pub fn new(index: MRIndex, overrides: HashMap<PathBuf, Vec<u8>>) -> Self {
         ModManager {
-            files,
+            files: index
+                .files
+                .iter()
+                .filter(|f| {
+                    f.env
+                        .as_ref()
+                        .map_or(true, |env| env.server != Requirement::Unsupported)
+                })
+                .cloned()
+                .collect(),
+            overrides,
             client: Client::new(),
         }
     }
 
     pub fn sync(&self) -> Result<(), FileError> {
+        println!("Syncing {} server files..", self.files.len());
         for file in &self.files {
             let current_file_result = File::open(&file.path);
 
@@ -40,6 +53,17 @@ impl ModManager {
             }
         }
 
+        println!("Syncing overrides..");
+        for (path, content) in &self.overrides {
+            let dir_path = path.parent().unwrap();
+            if !dir_path.exists() {
+                create_dir_all(dir_path)?;
+            }
+            let mut file = File::create(path)?;
+            std::io::copy(&mut content.as_slice(), &mut file)?;
+        }
+        println!("Sync complete!");
+
         Ok(())
     }
 
@@ -54,22 +78,15 @@ impl ModManager {
         let dir_path = Path::new(&file.path);
 
         if !dir_path.parent().unwrap().exists() {
-            println!("Creating directory: {:?}", dir_path.parent());
             create_dir_all(dir_path.parent().unwrap())?;
-            println!("Directory created successfully.");
         }
 
         let mut urls_iter = file.downloads.iter();
 
-        println!("Downloading file: {:?}", file.path);
-
         loop {
             match urls_iter.next() {
                 Some(url) => match self.try_download_file(url, &file.path) {
-                    Ok(()) => {
-                        println!("File {:?} downloaded successfully.", file.path);
-                        break Ok(());
-                    }
+                    Ok(()) => break Ok(()),
                     Err(_) => {
                         println!("Failed to download file {:?} from URL: {}", file.path, url);
                         continue;
